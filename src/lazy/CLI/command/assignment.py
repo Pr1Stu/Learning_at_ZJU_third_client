@@ -1,9 +1,10 @@
 import asyncio
 import logging
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import datetime, timezone
-from enum import Enum, unique
 from functools import partial
+from pathlib import Path
 from textwrap import dedent
 from typing import Annotated
 
@@ -16,18 +17,30 @@ from rich import filesize
 from rich import print as rprint
 from rich.align import Align
 from rich.console import Group
+from rich.live import Live
 from rich.padding import Padding
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn
+from rich.progress import (
+    Progress,
+    SpinnerColumn,
+    TextColumn,
+)
 from rich.rule import Rule
 from rich.table import Table
 from rich.text import Text
 
 from ...core.login.login import CredentialManager, ZjuAsyncClient
 from ...core.zjuAPI import zju_api
+from ...core.zjuAPI.types import (
+    AssignmentReadFilePayload,
+    AssignmentReadType,
+    AssignmentReadVideoPayload,
+)
 from ..config.config import type_map
 from ..state import state
+from ..types import AssignmentReadTask, AssignmentType, LegalFileType
 from ..utils.utils import (
+    format_timedelta,
     get_status_text,
     make_jump_url,
     print_with_json,
@@ -36,6 +49,7 @@ from ..utils.utils import (
 
 KEYRING_SERVICE_NAME = "lazy"
 KEYRING_LAZ_STUDENTID_NAME = "laz_studentid"
+CONCURRENCY_LIMIT = 20
 
 # assignment 命令组
 app = typer.Typer(help="""
@@ -48,14 +62,6 @@ app = typer.Typer(help="""
 
 logger = logging.getLogger(__name__)
 
-@unique
-class AssignmentType(Enum):
-    UNKOWN = 0
-    ACTIVITY = 1
-    FORMUN = 2
-    EXAM = 3
-    CLASSROOM = 4
-    
 def is_todo_show_amount_valid(amount: int):
     if amount <= 0:
         print("显示数量应为正数！")
@@ -114,14 +120,13 @@ def extract_subjects_json(subjects: list[dict], subject_type_map: dict)->list[di
     if not subjects:
         return None
     
-       
     for index, subject in enumerate(subjects):
         subject_description: str = subject.get("description")
         subject_point: int = subject.get("point", 0)
         subject_type: str = subject_type_map.get(subject.get("type"), subject.get("type"))
         subject_options: list[str] = []
         subject_answers: list[str] = []
-
+        logger.info(f"原 {subject.get('type')} 匹配后 {subject_type} map里面是 {subject_type_map}")
         if subject_type == "填空":
             answers: list[dict] = subject.get("correct_answers", [])
             for answer in answers:
@@ -160,7 +165,7 @@ def extract_subjects(subjects: list[dict], subject_type_map: dict)->list[Text|Pa
     
     for index, subject in enumerate(subjects):
         subject_description: str = extract_comment(subject.get("description"))
-        subject_point: int = subject.get("point", 0)
+        subject_point: int|str = subject.get("point", 0)
         subject_type: str = subject_type_map.get(subject.get("type"), subject.get("type"))
         subject_options: list[str] = []
         subject_answers: list[str] = []
@@ -255,14 +260,19 @@ async def guess_assignment_type(assignment_id: int, json: bool)->AssignmentType:
             raw_activity, raw_exam, raw_classroom = await asyncio.gather(*[
                 zju_api.assignmentViewAPIFits(client.session, assignment_id).get_api_data(),
                 zju_api.assignmentExamViewAPIFits(client.session, assignment_id, apis_name=["exam"]).get_api_data(),
-                zju_api.assignmentClassroomViewAPIFits(client.session, assignment_id, apis_name=["classroom"]).get_api_data()
+                zju_api.assignmentClassroomViewAPIFits(client.session, assignment_id, apis_name=["classroom"]).get_api_data(),
             ], return_exceptions=True)
 
         if raw_activity[0]:
             if raw_activity[0].get("type") == "forum":
-                progress.update(task, description="猜测是作业!", completed=1)
-                logger.info(f"猜测 {assignment_id} 为 Activity")    
+                progress.update(task, description="猜测是讨论!", completed=1)
+                logger.info(f"猜测 {assignment_id} 为 Forum")    
                 return AssignmentType.FORMUN
+            
+            if raw_activity[0].get("type") == "questionnaire":
+                progress.update(task, description="猜测是问卷!", completed=1)
+                logger.info(f"猜测 {assignment_id} 为 Questionnaire")    
+                return AssignmentType.QUESTIONNAIRE
             
             progress.update(task, description="猜测是作业!", completed=1)
             logger.info(f"猜测 {assignment_id} 为 Activity")
@@ -356,7 +366,8 @@ async def view_exam(exam_id: int, type_map: dict, preview: bool, json: bool):
                         "short_answer": "简答",
                         "multiple_selection": "多选",
                         "true_or_false": "判断",
-                        "fill_in_blank": "填空"
+                        "fill_in_blank": "填空",
+                        "analysis": "推断"
                     }
 
                     preview_content = extract_subjects_json(exam_subjects, subject_type_map, json)
@@ -430,7 +441,8 @@ async def view_exam(exam_id: int, type_map: dict, preview: bool, json: bool):
                     "short_answer": "简答",
                     "multiple_selection": "多选",
                     "true_or_false": "判断",
-                    "fill_in_blank": "填空"
+                    "fill_in_blank": "填空",
+                    "analysis": "推断"
                 }
 
                 exam_subjects_renderables = extract_subjects(exam_subjects, subject_type_map)
@@ -550,7 +562,8 @@ async def view_exam(exam_id: int, type_map: dict, preview: bool, json: bool):
                     "short_answer": "简答",
                     "multiple_selection": "多选",
                     "true_or_false": "判断",
-                    "fill_in_blank": "填空"
+                    "fill_in_blank": "填空",
+                    "analysis": "推断"
                 }
 
                 exam_subjects_renderables = extract_subjects(exam_subjects, subject_type_map)
@@ -668,7 +681,8 @@ async def view_classroom(
                         "short_answer": "简答",
                         "multiple_selection": "多选",
                         "true_or_false": "判断",
-                        "fill_in_blank": "填空"
+                        "fill_in_blank": "填空",
+                        "analysis": "推断"
                     }
 
                     preview_content = extract_subjects_json(classroom_subjects, subject_type_map)
@@ -763,7 +777,8 @@ async def view_classroom(
                     "short_answer": "简答",
                     "multiple_selection": "多选",
                     "true_or_false": "判断",
-                    "fill_in_blank": "填空"
+                    "fill_in_blank": "填空",
+                    "analysis": "推断"
                 }
 
                 classroom_subjects_renderables = extract_subjects(classroom_subjects, subject_type_map)
@@ -826,7 +841,7 @@ async def view_activity(
             student_id = keyring.get_password(KEYRING_SERVICE_NAME, KEYRING_LAZ_STUDENTID_NAME)
             
             if not student_id:
-                logger.error(f"{activity_id} 缺少'laz_studentid'参数，请将此问题上报给开发者！")
+                logger.error(f"{activity_id} 缺少'lazy_studentid'参数，请将此问题上报给开发者！")
                 if json:
                     print_with_json(False, "STUDENT_ID does not exist. Report it to developer,")
                     raise typer.Exit(code=1)
@@ -836,15 +851,9 @@ async def view_activity(
 
             # 请求主体数据
             raw_activity = (await zju_api.assignmentViewAPIFits(client.session, activity_id).get_api_data())[0]
-        
-            activity_completion_criterion_key: str = raw_activity.get("completion_criterion_key", "none")
-            
-            # 判断是否获取提交列表（必须是提交完成的任务且有提交记录）
-            if activity_completion_criterion_key == "submitted":
-                if raw_activity.get("user_submit_count") and raw_activity.get("user_submit_count") > 0:
-                    raw_submission_list = (await zju_api.assignmentSubmissionListAPIFits(client.session, activity_id, student_id).get_api_data())[0]
-                else:
-                    raw_submission_list = {}
+
+            if raw_activity.get("user_submit_count") and raw_activity.get("user_submit_count") > 0:
+                raw_submission_list = (await zju_api.assignmentSubmissionListAPIFits(client.session, activity_id, student_id).get_api_data())[0]
             else:
                 raw_submission_list = {}
             
@@ -879,6 +888,17 @@ async def view_activity(
                     submission_instructor_comment: str = submission.get("instructor_comment", None)
                     submission_score: int|None = submission.get("score") if submission.get("score") else "未评分"
                     submission_uploads_list: list[dict]|None = submission.get("uploads", None)
+                    
+                    # 原来老师评语也可以有附件？？？
+                    submission_correct: dict = submission.get('submission_correct', {})
+                    submission_correct_uploads_list: list = submission_correct.get('uploads', [])
+                    
+                    if all(submission_correct_uploads_list):
+                        submission_correct_uploads = extract_uploads_json(submission_correct_uploads_list)
+                    else:
+                        submission_correct_uploads = None
+                        
+
 
                     if submission_uploads_list:
                         submission_uploads = extract_uploads_json(submission_uploads_list)
@@ -889,6 +909,7 @@ async def view_activity(
                         "submmited_time": submission_created_time,
                         "comment": submission_comment,
                         "instructor_comment": submission_instructor_comment,
+                        "instructor_uploads": submission_correct_uploads,
                         "score": submission_score,
                         "uploads": submission_uploads
                     })
@@ -978,6 +999,10 @@ async def view_activity(
                 submission_score: int|None = submission.get("score") if submission.get("score") else "未评分"
                 submission_uploads: list[dict]|list = submission.get("uploads", [])
 
+                # 原来老师评语也可以有附件？？？
+                submission_correct: dict = submission.get('submission_correct', {})
+                submission_correct_uploads_list: list = submission_correct.get('uploads', [])
+
                 # --- 准备Panel内容 --- 
                 submission_inner_comment = Text.assemble(
                     submission_comment
@@ -1000,10 +1025,24 @@ async def view_activity(
                 submission_content_renderables.append(submission_head_text)
                 
                 if submission_inner_instructor_comment:
-                    submission_content_renderables.append("")
-                    submission_content_renderables.append("[cyan]老师评语: [/cyan]")
-                    submission_content_renderables.append(submission_inner_instructor_comment_block)
+                    submission_inner_instructor_comment_renderables = [Text(''), Text("老师评语: ", style='cyan'), submission_inner_instructor_comment_block]
                 
+                    # Fix: 老师评语也可以有附件
+                    if all(submission_correct_uploads_list):
+                        submission_inner_instructor_comment_renderables.extend([Text(''), *extract_uploads(submission_correct_uploads_list), Text('')])
+                        submission_content_renderables.append(Text(''))
+                        submission_content_renderables.append(Panel(
+                            Group(*submission_inner_instructor_comment_renderables),
+                            title = "[教师评阅]",
+                            border_style="bright_black",
+                            expand=True,
+                            padding=(1, 2)
+                        ))
+                        submission_content_renderables.append(Text(''))
+                    else:
+                        submission_content_renderables.extend(submission_inner_instructor_comment_renderables)
+
+
                 if submission_inner_comment:
                     submission_content_renderables.append("")
                     submission_content_renderables.append("[cyan]提交内容: [/cyan]")
@@ -1031,7 +1070,7 @@ async def view_activity(
             content_renderables.append("")
             content_renderables.append(submission_list_panel)
         
-        if activity_completion_criterion_key == "submitted" and not raw_submission_list:
+        if not raw_submission_list:
             content_renderables.append("")
             content_renderables.append("无提交记录")
 
@@ -1217,6 +1256,380 @@ async def view_forum(
 
     rprint(activity_panel)
 
+async def view_questionnaire(
+    questionnaire_id: int,
+    type_map: dict,
+    preview: bool,
+    json: bool
+):
+    
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        transient=True,
+        disable=json
+    ) as progress:
+        
+        task = progress.add_task(description="请求数据中...", total=2)
+        
+        cookies = CredentialManager().load_cookies()
+        if not cookies:
+            if json:
+                print_with_json(False, "Cookies is unacceptable.")
+                logger.error("Cookies不存在！")
+                raise typer.Exit(code=1)
+            
+            rprint("Cookies不存在！")
+            logger.error("Cookies不存在！")
+            raise typer.Exit(code=1)
+        
+        async with ZjuAsyncClient(cookies=cookies, trust_env=state.trust_env) as client:
+            # 请求主体数据
+            raw_activity = (await zju_api.assignmentViewAPIFits(client.session, questionnaire_id).get_api_data())[0]
+        
+            questionnaire_completion_criterion_key: str = raw_activity.get("completion_criterion_key", "none")
+            
+            # 判断是否获取提交列表（必须是提交完成的任务且有提交记录）
+            if questionnaire_completion_criterion_key == "submitted":
+                raw_submission_list = (await zju_api.assignmentViewQuestionnaireSubmissionsAPIFits(client.session, questionnaire_id).get_api_data())[0]
+            else:
+                raw_submission_list = {}
+
+            if preview:
+                raw_questionnaire_subjects = (await zju_api.assignmentViewQuestionnaireAPIFits(client.session, questionnaire_id).get_api_data())[0]
+
+        progress.advance(task, 1)
+        progress.update(task, description="渲染数据中...")
+
+        # --- 渲染阶段 ---
+        # 解析返回内容
+        # 任务名称
+        questionnaire_title = raw_activity.get("title", "null")
+        questionnaire_type = type_map.get(raw_activity.get("type", "null"), raw_activity.get("type", "null"))
+        questionnaire_description: str = extract_comment(raw_activity.get("data", {}).get("description", ""))
+
+        # 开放时间
+        questionnaire_start_time = transform_time(raw_activity.get("start_time"))
+        
+        # 截止日期
+        questionnaire_end_time = transform_time(raw_activity.get("end_time"))
+
+        # --- JSON FORMAT HEAD ---
+        if json:
+            uploads_list = raw_activity.get("uploads", None)
+            uploads = extract_uploads_json(uploads_list) if uploads_list else None
+
+            # --- 解析提交列表 ---
+            if raw_submission_list:
+                submissions_list = []
+                submissions: list[dict] = raw_submission_list.get("submissions", [])
+
+                for submission in submissions:
+                    submission_created_time = transform_time(submission.get("created_at"))
+                    submission_score = submission.get('score', 'null')
+
+                    submissions_list.append({
+                        "submitted_time": submission_created_time,
+                        "score": submission_score
+                    })
+            else:
+                submissions_list = None
+
+            # --- 解析预览内容 ---
+            if preview:
+                if not raw_questionnaire_subjects or not raw_questionnaire_subjects.get('subjects', []):
+                    preview_content = "Preview Failed."
+                else:
+                    questionnaire_subjects: list[dict] = raw_questionnaire_subjects.get('subjects', [])
+
+                    subject_type_map = {
+                        "single_selection": "单选",
+                        "short_answer": "简答",
+                        "multiple_selection": "多选",
+                        "true_or_false": "判断",
+                        "fill_in_blank": "填空",
+                        "analysis": "推断"
+                    }
+
+                    preview_content = extract_subjects_json(questionnaire_subjects, subject_type_map)
+            else:
+                preview_content = None
+
+            result = {
+                "title": questionnaire_title,
+                "type": questionnaire_type,
+                "start_time": questionnaire_start_time,
+                "end_time": questionnaire_end_time,
+                "description": questionnaire_description,
+                "uploads": uploads,
+                "submissions": submissions_list,
+                "preview": preview_content
+            }
+
+            print_with_json(True, "Questionnaire View", result)
+            return
+        # --- JSON FORMAT END ---
+
+        start_time_text = Text.assemble(
+            ("开放时间: ", "cyan"),
+            (questionnaire_start_time, "bright_white")
+        )
+        end_time_text = Text.assemble(
+            ("截止时间: ", "cyan"),
+            (questionnaire_end_time, "bright_white")
+        )
+
+        questionnaire_description_text = Text.assemble(
+            questionnaire_description
+        )
+        questionnaire_description_block = Padding(questionnaire_description_text, (0, 0, 0, 2))
+
+        # --- 准备 Panel 内容 ---
+        content_renderables = []
+        title_line = Align.center(Text.assemble((f"{questionnaire_title}", "bold bright_magenta")))
+        content_renderables.append(title_line)
+        content_renderables.append(start_time_text)
+        content_renderables.append(end_time_text)
+
+        if questionnaire_description_text:
+            content_renderables.append("[cyan]任务描述: [/cyan]")
+            content_renderables.append(questionnaire_description_block)
+            content_renderables.append("")
+
+        # 读取附件（如果有的话）
+        uploads: list[dict] = raw_activity.get("uploads")
+        if uploads:
+            content_renderables.append("")
+            content_renderables.extend(extract_uploads(uploads))
+
+        # 读取提交列表（如果有的话）
+        if raw_submission_list:
+            # 准备Submission的Panel内容
+            submission_content_renderables = []
+            submission_list: list[dict] = raw_submission_list.get("submissions")
+            
+            for submission in submission_list:
+                submission_created_time = transform_time(submission.get("created_at"))
+                submission_score = submission.get('score', 'null')
+
+                # --- 准备Panel内容 --- 
+                submission_head_text = Text.assemble(
+                    ("提交时间: ", "cyan"),
+                    submission_created_time,
+                    "\n",
+                    ("最终得分: ", "cyan"),
+                    (f"{submission_score}", "bright_white")
+                )
+
+                submission_content_renderables.append(submission_head_text)
+                
+                if submission != submission_list[-1]:
+                    submission_content_renderables.append(Rule(style="dim white"))
+                    submission_content_renderables.append("")
+
+            # --- 装配Submission List Panel ---
+            submission_list_panel = Panel(
+                Group(*submission_content_renderables),
+                title = "[yellow][提交记录][/yellow]",
+                border_style="yellow",
+                expand=True,
+                padding=(1, 2)
+            )
+            content_renderables.append("")
+            content_renderables.append(submission_list_panel)
+
+        if questionnaire_completion_criterion_key == "submitted" and not raw_submission_list:
+            content_renderables.append("")
+            content_renderables.append("无提交记录")
+
+        # --- 解析预览内容 ---
+        if preview:
+            questionnaire_subjects_renderables = []
+
+            if not raw_questionnaire_subjects or not raw_questionnaire_subjects.get('subjects', []):
+                preview_error_text = Text.assemble(
+                    ("(╥╯^╰╥) 预览失效了……", "red"),
+                    "\n",
+                    ("未知错误导致无法预览题目。", "dim")
+                )
+
+                questionnaire_subjects_renderables.append(preview_error_text)
+            else:
+                questionnaire_subjects: list[dict] = raw_questionnaire_subjects.get('subjects', [])
+                                
+                subject_type_map = {
+                    "single_selection": "单选",
+                    "short_answer": "简答",
+                    "multiple_selection": "多选",
+                    "true_or_false": "判断",
+                    "fill_in_blank": "填空",
+                    "analysis": "推断"
+                }
+
+                questionnaire_subjects_renderables = extract_subjects(questionnaire_subjects, subject_type_map)
+
+            questionnaire_preview_subjects_panel = Panel(
+                Group(*questionnaire_subjects_renderables),
+                title = "[yellow][内容预览][/yellow]",
+                border_style="cyan",
+                expand=True,
+                padding=(1, 2)
+            )
+
+            content_renderables.append("")
+            content_renderables.append(questionnaire_preview_subjects_panel)
+
+        questionnaire_panel = Panel(
+            Group(*content_renderables),
+            title = f"[white][{questionnaire_type}][/white]",
+            border_style="dim",
+            expand=True,
+            padding=(1, 2)
+        )
+
+        progress.advance(task, 1)
+        progress.update(task, description="渲染完成")
+
+        rprint(questionnaire_panel)
+
+async def sub_read_assignment_controller(
+        client: ZjuAsyncClient,
+        tasks: list[AssignmentReadTask],
+        semaphore: asyncio.Semaphore,
+        main_progress: Progress,
+        sub_progress: Progress,
+    ):
+    assignment_id = tasks[0].assignment_id
+    title = tasks[0].assignment_title
+    assignment_tasks = []
+
+    main_task = main_progress.add_task(description=f'[{assignment_id}]{title}', total=3)
+    main_progress.update(
+        main_task, 
+        description=f'[{assignment_id}]{title}: 加载共 {len(tasks)} 个任务中...', 
+        completed=1)
+
+    for task in tasks:
+        assignment_tasks.append(
+            sub_read_assignment(
+                client=client,
+                read_task=task,
+                semaphore=semaphore,
+                sub_progress=sub_progress
+            )
+        )
+
+    main_progress.update(
+        main_task,
+        description=f'[{assignment_id}]{title}: 执行共 {len(tasks)} 个任务中',
+        completed=2
+    )
+    results: list[bool] = await asyncio.gather(*assignment_tasks)
+    
+    if results and all(results):
+        main_progress.update(
+            main_task,
+            description=f'[green][cyan][{assignment_id}][cyan]{title}: 已完成 [cyan]{len(tasks)}[/cyan] 个任务！',
+            completed=3
+        )
+        return True
+    if not results:
+        logger.error('遇到了未知错误！请将此错误报告给开发者！')
+        main_progress.update(
+            main_task,
+            description='[red]发生未知错误！',
+            completed=3
+        )
+        return False
+    
+    faults = 0
+    for r in results:
+        if r:
+            continue
+
+        faults += 1
+
+    main_progress.update(
+        main_task,
+        description=f'[yellow][[cyan]{assignment_id}[/cyan]]{title}: 完成 [cyan]{faults}/{len(tasks)}[/cyan] 个任务',
+        completed=3
+    )
+    return False
+
+async def sub_read_assignment(
+        client: ZjuAsyncClient,
+        read_task: AssignmentReadTask, 
+        semaphore: asyncio.Semaphore, 
+        sub_progress: Progress)->bool:
+
+    task = sub_progress.add_task(description=f'    └──[yellow]{read_task.resource_name} 加载中...', total=1)
+
+    video_duration = 60
+
+    if read_task.mode == AssignmentReadType.VIDEO:
+        curr_time = 0
+        while True:
+            calls = [zju_api.assignmentReadAPIFits(
+                client.session, 
+                assignment_id = read_task.assignment_id,
+                payload = AssignmentReadVideoPayload(
+                    curr_time + 1,
+                    curr_time + video_duration
+                )
+            ).post_api_data()]
+
+            async def call_wrapper(call):
+                async with semaphore:
+                    return await call
+
+            read_tasks = [
+                call_wrapper(call) for call in calls
+            ]
+
+            results = await asyncio.gather(*read_tasks, return_exceptions=True)
+
+            if not isinstance(results[-1], Exception):
+                # completeness = results[-1][0].get('completeness')
+
+                # if completeness == 'full':
+                #     sub_progress.update(task, description=f"    └──[green]{read_task.resource_name} 已完成！[/green]", completed=1)
+                #     return True
+
+                curr_time += 60
+                sub_progress.update(task, description=f"    └──[green]{read_task.resource_name} {format_timedelta(curr_time)}")
+            else:
+                sub_progress.update(task, description=f"    └──[red]{read_task.resource_name} 发生错误！[/red]", completed=1)
+                logger.error(f"完成任务 {read_task} 时发生错误: {results[-1]}")
+                return False
+    
+    if read_task.mode == AssignmentReadType.FILE:
+        async with semaphore:
+            # await zju_api.assignmentReadAPIFits(
+            #     client.session, 
+            #     read_task.assignment_id,
+            #     AssignmentReadFilePayload(
+            #         upload = ''
+            #     )
+            # ).post_api_data()
+
+            result = await zju_api.assignmentReadAPIFits(
+                client.session, 
+                read_task.assignment_id,
+                AssignmentReadFilePayload(
+                    upload = read_task.resource_id
+                )
+            ).post_api_data()
+
+        if result[0].get('completeness') == 'full':
+            sub_progress.update(task, description=f"    └──[green]{read_task.resource_name} 已完成！[/green]", completed=1)
+            return True
+        
+        sub_progress.update(task, description=f"    └──[red]{read_task.resource_name} 发生错误！[/red]", completed=1)
+        logger.error(f"完成任务 {read_task} 时发生错误: {result[-1]}")
+        return False
+
+    return False
+
 @app.command(
     "vw",
     help="Alias for 'view'",
@@ -1251,6 +1664,7 @@ async def view_assignment(
     classroom: Annotated[bool | None, typer.Option("--classroom", "-c", help="启用此选项，将查询对应课堂任务")] = False,
     activity: Annotated[bool | None, typer.Option("--activity", "-H", help="启用此选项，将查询对应作业")] = False,
     forum: Annotated[bool | None, typer.Option("--forum", "-F", help="启用此选项，将查询对应讨论")] = False,
+    questionnaire: Annotated[bool | None, typer.Option("--questionnaire", "-Q", help="启用此选项，将查询对应问卷")] = False,
     preview: Annotated[bool | None, typer.Option("--preview", "-P", help="启用此选项，预览测试或课堂任务题目")] = False,
     json: Annotated[bool | None, typer.Option("--json", "-J", hidden=True)] = False
 ):
@@ -1264,11 +1678,12 @@ async def view_assignment(
     assignment_type = AssignmentType.UNKOWN
 
     # 猜测任务类型
-    match (activity, forum, exam, classroom): 
-        case (True, _, _, _): assignment_type = AssignmentType.ACTIVITY
-        case (_, True, _, _): assignment_type = AssignmentType.FORMUN
-        case (_, _, True, _): assignment_type = AssignmentType.EXAM
-        case (_, _, _, True): assignment_type = AssignmentType.CLASSROOM
+    match (activity, forum, exam, classroom, questionnaire): 
+        case (True, _, _, _, _): assignment_type = AssignmentType.ACTIVITY
+        case (_, True, _, _, _): assignment_type = AssignmentType.FORMUN
+        case (_, _, True, _, _): assignment_type = AssignmentType.EXAM
+        case (_, _, _, True, _): assignment_type = AssignmentType.CLASSROOM
+        case (_, _, _, _, True): assignment_type = AssignmentType.QUESTIONNAIRE
         case _: assignment_type =  await guess_assignment_type(assignment_id, json)
 
     if assignment_type == AssignmentType.UNKOWN:
@@ -1276,6 +1691,7 @@ async def view_assignment(
             print_with_json(True, f"Assignment {assignment_id} doesn't exist.")
         
         rprint(f"任务 {assignment_id} 不存在！")
+        raise typer.Exit(code=1)
 
     if assignment_type in (AssignmentType.ACTIVITY, AssignmentType.FORMUN) and preview:
         if json:
@@ -1296,7 +1712,8 @@ async def view_assignment(
         AssignmentType.ACTIVITY: view_activity_wrapper,
         AssignmentType.FORMUN: view_forum_wrapper,
         AssignmentType.EXAM: view_exam,
-        AssignmentType.CLASSROOM: view_classroom
+        AssignmentType.CLASSROOM: view_classroom,
+        AssignmentType.QUESTIONNAIRE: view_questionnaire
     }
 
     await view_callable_map[assignment_type](assignment_id, type_map, preview, json)
@@ -1667,3 +2084,191 @@ async def open_topic(
             rprint("[green]提交成功！[/green]")
         else:
             rprint("[red]提交失败！[/red]")
+
+@app.command(
+    "rd",
+    help="Alias for 'read'",
+    hidden=True,
+    epilog=dedent("""
+        EXAMPLES:
+
+          $ lazy assignment rd 114514 666
+            (完成 ID 为'114514'与'666'作业下的所有阅读任务)
+    """),
+    no_args_is_help=True)
+@app.command(
+    "read",
+    help="完成视频或文档的阅读任务，",
+    epilog=dedent("""
+        EXAMPLES:
+
+          $ lazy assignment read 114514 666
+            (完成 ID 为'114514'与'666'作业下的所有阅读任务)
+    """),
+    no_args_is_help=True)
+@partial(syncify, raise_sync_error=False)
+async def read_assignment(
+    assignments_id: Annotated[list[int], typer.Argument(help="任务ID")],
+    json: Annotated[bool | None, typer.Option("--json", "-J", hidden=True, help="启用JSON输出")] = False
+):
+    table = Table.grid(expand=True)
+    progress = Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        transient=True,
+        disable=json
+    )
+    render_group = Group(
+        progress,
+        table
+    )
+
+    with Live(render_group, refresh_per_second=10) if not json else nullcontext():
+        task = progress.add_task(description='请求数据中...', total=4)
+
+        semaphore = asyncio.Semaphore(CONCURRENCY_LIMIT)
+        cookies = CredentialManager().load_cookies()
+        if not cookies:
+            if json:
+                print_with_json(False, "Cookies is unacceptable.")
+                logger.error("Cookies不存在！")
+                raise typer.Exit(code=1)
+            
+            rprint("Cookies不存在！")
+            logger.error("Cookies不存在！")
+            raise typer.Exit(code=1)
+
+        async with ZjuAsyncClient(cookies=cookies, trust_env=state.trust_env) as client:
+            # 预先判断任务附件
+            progress.update(
+                task,
+                description='加载待完成任务中...',
+                completed=1
+            )
+            pre_tasks = [zju_api.assignmentViewAPIFits(client.session, assignment_id).get_api_data() for assignment_id in assignments_id]
+            results = await asyncio.gather(*pre_tasks, return_exceptions=True)
+            read_tasks: dict[int, list[AssignmentReadTask]] = {}
+            for assignment_id ,result in zip(assignments_id, results, strict=True):
+                if isinstance(result, Exception):
+                    continue
+
+                raw_activity = result[0]
+                title = raw_activity.get('title', 'null')
+                uploads_list = raw_activity.get("uploads", None)
+                uploads: list[dict] = extract_uploads_json(uploads_list) if uploads_list else None
+
+                for upload in uploads:
+                    if not upload.get('id'):
+                        continue
+
+                    task_type = ''
+                    filename = upload.get('filename')
+                    ext = ''.join(Path(filename).suffixes)[1:]
+                    
+                    if ext in LegalFileType.video:
+                        task_type = AssignmentReadType.VIDEO
+                    elif ext in LegalFileType.document:
+                        task_type = AssignmentReadType.FILE
+                    else:
+                        continue
+                    
+                    if assignment_id not in read_tasks:
+                        read_tasks[assignment_id] = []
+
+                    read_tasks[assignment_id].append(AssignmentReadTask(
+                        title,
+                        assignment_id,
+                        task_type,
+                        upload.get('filename'),
+                        upload.get('id')
+                    ))
+
+            if json and not read_tasks:
+                print_with_json(True, "No video or document reading tasks found in the specified assignments.")
+                return
+
+            logger.info(f"Loading {len(read_tasks)} reading tasks")       
+            progress.update(
+                task,
+                description=f"初始化 {len(read_tasks)} 个作业中...",
+                completed=2
+            )
+
+            # 加载所有 task progress 并装入 Table
+            assignments_tasks = []
+
+            for _, tasks in read_tasks.items():
+                # Assignment Main Progress
+                main_progress = Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    transient=False,
+                    disable=json
+                )
+                
+                # Assignment Video/File Reading Progress
+                sub_progress = Progress(
+                    TextColumn("[progress.description]{task.description}"),
+                    transient=False,
+                    disable=json
+                )
+
+                table.add_row(main_progress)
+                table.add_row(sub_progress)
+
+                assignments_tasks.append(sub_read_assignment_controller(
+                    client,
+                    tasks,
+                    semaphore,
+                    main_progress,
+                    sub_progress
+                ))
+                                
+            progress.update(
+                task,
+                description=f'完成 {len(read_tasks)} 个作业中...',
+                completed=3
+            )
+
+            results = await asyncio.gather(*assignments_tasks)
+
+            if json:
+                json_results = []
+                for (assignment_id, tasks), completed in zip(read_tasks.items(), results, strict=True):
+                    json_results.append({
+                        "assignment_id": assignment_id,
+                        "title": tasks[0].assignment_title if tasks else "",
+                        "total_tasks": len(tasks),
+                        "completed": completed
+                    })
+                overall_success = all(results) if results else False
+                print_with_json(overall_success, "Read Assignments", json_results)
+                return
+
+            if results and all(results):
+                progress.update(
+                    task,
+                    description='[green]已完成！',
+                    completed=3
+                )
+                render_group.renderables[0] = '[green]已完成！'
+                return
+            
+            if not results:
+                logger.error('遇到了未知错误！请将此错误报告给开发者！')
+                progress.update(
+                    task,
+                    description='[red]发生未知错误！',
+                    completed=3
+                )
+                render_group.renderables[0] = '[red]发生未知错误！'
+                raise typer.Exit(code=1)
+            
+            logger.error(f'阅读任务时发生错误: {results}')
+            progress.update(
+                task,
+                description='[red]发生错误！',
+                completed=3
+            )
+            render_group.renderables[0] = '[red]发生错误！'
+            raise typer.Exit(code=1)
